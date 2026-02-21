@@ -1351,6 +1351,17 @@ def compare_failing_vs_passing(job_name: str, failing_build: int = 0) -> str:
     if infra_lines:
         sections.append("=== INFRA DIFF ===\n" + "\n".join(infra_lines))
 
+    # Duration diff
+    fail_dur = round((fail_data.get("duration") or 0) / 1000, 1)
+    pass_dur = round((pass_data.get("duration") or 0) / 1000, 1)
+    if abs(fail_dur - pass_dur) > 10:
+        sections.append(
+            f"=== DURATION DIFF ===\n"
+            f"  Passing #{last_pass['number']}: {pass_dur}s\n"
+            f"  Failing #{failing_build}: {fail_dur}s\n"
+            f"  Delta: {fail_dur - pass_dur:+.1f}s"
+        )
+
     # Cumulative commits in the gap
     gap_start = last_pass["number"] + 1
     gap_end = failing_build
@@ -1425,7 +1436,6 @@ def deep_dive_test_failures(job_name: str, build_number: int) -> str:
 
     # Prioritize REGRESSION-status tests, then take up to cap
     failing = report["failing_tests"][:_DEEP_DIVE_MAX_TESTS]
-    test_keys = {f"{t['class_name']}.{t['test_name']}" for t in failing}
 
     # Fetch previous builds' test reports (reuse across all tests)
     prev_reports: list[tuple[int, dict | None]] = []
@@ -1445,16 +1455,59 @@ def deep_dive_test_failures(job_name: str, build_number: int) -> str:
             r = None
         prev_reports.append((b["number"], r))
 
-    # Also fetch build data for regression commit identification
-    prev_build_data: dict[int, dict] = {}
-    for bn, r in prev_reports:
-        if r is not None:
-            time.sleep(_BUNDLE_PACING)
-            try:
-                prev_build_data[bn] = jenkins_api.get_build(job_name, bn)
-            except Exception:
-                pass
+    # --- Pass 1: determine regression build for each test ---
+    test_analysis: list[dict] = []
+    regression_builds_needed: set[int] = set()
 
+    for test in failing:
+        key = f"{test['class_name']}.{test['test_name']}"
+
+        run_history: list[str] = []
+        for bn, r in prev_reports:
+            if r is None:
+                run_history.append(f"#{bn}:?")
+                continue
+            test_found = any(
+                f"{ft['class_name']}.{ft['test_name']}" == key
+                for ft in r.get("failing_tests", [])
+            )
+            run_history.append(f"#{bn}:{'FAIL' if test_found else 'PASS'}")
+
+        run_history.reverse()
+        run_history.append(f"#{build_number}:FAIL")
+
+        # Walk chronologically to find the most recent PASS→FAIL transition
+        regression_build: int | None = None
+        last_pass_seen = False
+        for entry in run_history:
+            bn_str, result = entry.split(":")
+            bn_val = int(bn_str.lstrip("#"))
+            if result == "PASS":
+                last_pass_seen = True
+            elif result == "FAIL":
+                if last_pass_seen:
+                    regression_build = bn_val
+                last_pass_seen = False
+
+        if regression_build is not None and regression_build != build_number:
+            regression_builds_needed.add(regression_build)
+
+        test_analysis.append({
+            "test": test, "key": key,
+            "run_history": run_history,
+            "regression_build": regression_build,
+        })
+
+    # Fetch build data only for identified regression builds
+    regression_build_data: dict[int, dict] = {}
+    for bn in regression_builds_needed:
+        time.sleep(_BUNDLE_PACING)
+        try:
+            regression_build_data[bn] = jenkins_api.get_build(job_name, bn)
+        except Exception:
+            pass
+
+    # --- Pass 2: format output ---
     sections: list[str] = []
     sections.append(
         f"=== TEST FAILURE ANALYSIS ===\n"
@@ -1463,47 +1516,34 @@ def deep_dive_test_failures(job_name: str, build_number: int) -> str:
         f"Analyzing top {len(failing)} failing tests:"
     )
 
-    for test in failing:
-        key = f"{test['class_name']}.{test['test_name']}"
+    for entry in test_analysis:
+        test = entry["test"]
+        key = entry["key"]
+        run_history = entry["run_history"]
+        regression_build = entry["regression_build"]
+
         test_lines = [f"\n  TEST: {key}"]
         if test["error_details"]:
             test_lines.append(f"  Error: {test['error_details'][:150]}")
 
-        # Build history for this test
-        run_history: list[str] = []
-        first_failure_build: int | None = None
-
-        for bn, r in prev_reports:
-            if r is None:
-                run_history.append(f"#{bn}:?")
-                continue
-            found = False
-            for suite in [] if r is None else []:
-                pass
-            test_found = False
-            for ft in r.get("failing_tests", []):
-                if f"{ft['class_name']}.{ft['test_name']}" == key:
-                    run_history.append(f"#{bn}:FAIL")
-                    first_failure_build = bn
-                    test_found = True
-                    break
-            if not test_found:
-                run_history.append(f"#{bn}:PASS")
-                first_failure_build = None
-
-        run_history.reverse()
-        run_history.append(f"#{build_number}:FAIL")
-
         test_lines.append(f"  History: {' → '.join(run_history)}")
 
-        if first_failure_build is None:
+        if regression_build is None:
+            if prev_builds:
+                test_lines.append(
+                    f"  Status: Persistent failure (failing in all {len(prev_builds)} prior builds checked)"
+                )
+            else:
+                test_lines.append("  Status: No prior build history available to determine regression point")
+        elif regression_build == build_number:
             test_lines.append("  Status: NEW failure (passed in all prior builds)")
-            first_failure_build = build_number
+        else:
+            test_lines.append(f"  Status: Regression started at build #{regression_build}")
 
-        if first_failure_build in prev_build_data:
-            commits = scm.extract_changesets(prev_build_data[first_failure_build])
+        if regression_build is not None and regression_build in regression_build_data:
+            commits = scm.extract_changesets(regression_build_data[regression_build])
             if commits:
-                test_lines.append(f"  Suspect commit (build #{first_failure_build}):")
+                test_lines.append(f"  Suspect commit (build #{regression_build}):")
                 for c in commits[:3]:
                     test_lines.append(f"    [{c['commit_id']}] {c['author']}: {c['message'][:80]}")
 
