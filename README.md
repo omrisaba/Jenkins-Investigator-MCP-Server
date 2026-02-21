@@ -2,6 +2,8 @@
 
 A [Model Context Protocol](https://modelcontextprotocol.io/) server that helps AI assistants debug failing Jenkins CI jobs efficiently — without blowing through a context window.
 
+> **Note:** This codebase was generated with AI assistance (Claude/Cursor) and reviewed, tested, and validated by humans.
+
 ## How It Works
 
 Raw Jenkins API responses are enormous. This server acts as a filter: it fetches the verbose data, strips the noise, and returns only what matters — error snippets, commit messages, failing tests.
