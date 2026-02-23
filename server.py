@@ -13,7 +13,9 @@ import logging
 import os
 import re
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 import requests
@@ -41,6 +43,7 @@ mcp = FastMCP(
         "Start with investigate_build_failure for a complete RCA picture of any failing job — "
         "it gives you build info, stages, errors, tests, commits, parameters, and trend in one call. "
         "Use compare_failing_vs_passing to understand what changed between the last pass and first fail. "
+        "Use search_across_jobs to find a specific error across all jobs in a folder in one call. "
         "For follow-up, use individual tools: get_stage_logs to zoom into a stage, "
         "search_console_log to grep for a pattern, get_build_artifacts for artifacts. "
         "Use list_jobs to discover jobs, triage_folder for team health. "
@@ -1816,6 +1819,235 @@ def diagnose_infrastructure_issue(job_name: str, build_number: int) -> str:
     if len(result_lines) > _INFRA_HARD_CAP:
         result = "\n".join(result_lines[:_INFRA_HARD_CAP])
         result += f"\n[Output truncated at {_INFRA_HARD_CAP} lines]"
+    return result
+
+
+_SEARCH_ACROSS_MAX_JOBS = 50
+_SEARCH_ACROSS_MAX_MATCHES_PER_JOB = 5
+_SEARCH_ACROSS_TOTAL_MATCHES = 30
+_SEARCH_ACROSS_TAIL_BYTES = 500_000
+_SEARCH_ACROSS_WORKERS = 8
+_SEARCH_ACROSS_OUTPUT_CAP = 300
+
+
+@mcp.tool
+def search_across_jobs(
+    folder: str,
+    pattern: str,
+    is_regex: bool = False,
+    build_selector: str = "last",
+    filter_status: str = "all",
+    recursive: bool = False,
+    context_lines: int = 2,
+) -> str:
+    """Search console logs across all jobs in a folder for a specific error
+    pattern.  Returns matching lines grouped by job.  Searches the tail of
+    each log (~500 KB) concurrently to minimise data transfer and latency.
+
+    Args:
+        folder: Jenkins folder to search (empty string for root).
+        pattern: Search string or regex to find in console logs.
+        is_regex: Treat pattern as regex (default: literal match).
+        build_selector: Which build per job: "last" or "last_failed".
+        filter_status: Pre-filter jobs: "all", "failing", or "unstable_and_failing".
+        recursive: Recurse into subfolders (default false).
+        context_lines: Lines of context around each match (default 2).
+    """
+    # --- Step 1: Discover jobs (1 API call, +1 per subfolder if recursive) ---
+    try:
+        jobs = jenkins_api.get_folder_jobs(folder, include_last_failed=True)
+    except Exception as exc:
+        time.sleep(TOOL_DELAY)
+        return _handle_error(exc, "search_across_jobs")
+
+    real_jobs = [j for j in jobs if j.get("_class", "") not in _FOLDER_CLASSES]
+    subfolders = [j for j in jobs if j.get("_class", "") in _FOLDER_CLASSES]
+
+    if recursive and subfolders:
+        for sf in subfolders[:10]:
+            try:
+                sub_path = f"{folder}/{sf['name']}" if folder else sf["name"]
+                sub_jobs = jenkins_api.get_folder_jobs(sub_path, include_last_failed=True)
+                for sj in sub_jobs:
+                    if sj.get("_class", "") not in _FOLDER_CLASSES:
+                        sj["name"] = f"{sf['name']}/{sj['name']}"
+                        real_jobs.append(sj)
+            except Exception:
+                pass
+
+    # Apply status filter
+    if filter_status == "failing":
+        real_jobs = [j for j in real_jobs if j.get("color", "").startswith("red")]
+    elif filter_status == "unstable_and_failing":
+        real_jobs = [
+            j for j in real_jobs
+            if j.get("color", "").startswith(("red", "yellow"))
+        ]
+
+    # Prioritise failing > unstable > rest
+    def _color_priority(j):
+        c = j.get("color", "")
+        if c.startswith("red"):
+            return 0
+        if c.startswith("yellow"):
+            return 1
+        return 2
+
+    real_jobs.sort(key=_color_priority)
+    total_jobs_found = len(real_jobs)
+
+    # Resolve build number per job
+    candidates: list[tuple[str, int, str]] = []
+    for j in real_jobs[:_SEARCH_ACROSS_MAX_JOBS]:
+        job_path = f"{folder}/{j['name']}" if folder else j["name"]
+        if build_selector == "last_failed":
+            bn = j.get("last_failed_build_number")
+            result_str = "FAILURE"
+        else:
+            bn = j.get("last_build_number")
+            result_str = j.get("last_result") or "?"
+        if bn is not None:
+            candidates.append((job_path, bn, result_str))
+
+    if not candidates:
+        time.sleep(TOOL_DELAY)
+        qualifier = f" (filter: {filter_status})" if filter_status != "all" else ""
+        return f"No jobs with matching builds found in '{folder or '(root)'}'{qualifier}."
+
+    # Compile search pattern
+    if is_regex:
+        try:
+            compiled = re.compile(pattern, re.IGNORECASE)
+        except re.error:
+            compiled = re.compile(re.escape(pattern), re.IGNORECASE)
+    else:
+        compiled = re.compile(re.escape(pattern), re.IGNORECASE)
+
+    # --- Step 2: Concurrent log search ---
+    state = {"match_count": 0}
+    lock = threading.Lock()
+    stop_event = threading.Event()
+
+    def _search_one(job_path: str, build_number: int, build_result: str) -> dict:
+        if stop_event.is_set():
+            return {"job": job_path, "build": build_number, "skipped": True}
+
+        try:
+            text = jenkins_api.get_console_text_tail(
+                job_path, build_number, _SEARCH_ACROSS_TAIL_BYTES,
+            )
+        except Exception as exc:
+            return {
+                "job": job_path, "build": build_number,
+                "error": str(exc)[:100],
+            }
+
+        lines = text.splitlines()
+        match_indices = [i for i, line in enumerate(lines) if compiled.search(line)]
+
+        if not match_indices:
+            return {"job": job_path, "build": build_number, "matches": 0}
+
+        with lock:
+            state["match_count"] += len(match_indices)
+            if state["match_count"] >= _SEARCH_ACROSS_TOTAL_MATCHES:
+                stop_event.set()
+
+        match_set = set(match_indices)
+        capped = match_indices[:_SEARCH_ACROSS_MAX_MATCHES_PER_JOB]
+        ranges: list[tuple[int, int]] = []
+        for idx in capped:
+            s = max(0, idx - context_lines)
+            e = min(len(lines) - 1, idx + context_lines)
+            if ranges and s <= ranges[-1][1] + 1:
+                ranges[-1] = (ranges[-1][0], max(ranges[-1][1], e))
+            else:
+                ranges.append((s, e))
+
+        snippets: list[str] = []
+        for s, e in ranges:
+            snippet = []
+            for i in range(s, e + 1):
+                marker = ">>>" if i in match_set else "   "
+                snippet.append(f"{marker} L{i + 1}: {lines[i]}")
+            snippets.append("\n".join(snippet))
+
+        return {
+            "job": job_path, "build": build_number,
+            "result": build_result,
+            "matches": len(match_indices),
+            "snippets": snippets,
+        }
+
+    search_results: list[dict] = []
+    errors: list[dict] = []
+    no_match_count = 0
+    skipped_count = 0
+
+    with ThreadPoolExecutor(max_workers=_SEARCH_ACROSS_WORKERS) as executor:
+        futures = {
+            executor.submit(_search_one, *c): c for c in candidates
+        }
+        for future in as_completed(futures):
+            r = future.result()
+            if r.get("skipped"):
+                skipped_count += 1
+            elif r.get("error"):
+                errors.append(r)
+            elif r.get("matches", 0) == 0:
+                no_match_count += 1
+            else:
+                search_results.append(r)
+
+    search_results.sort(key=lambda r: r.get("matches", 0), reverse=True)
+
+    # --- Step 3: Format output ---
+    sections: list[str] = []
+    matched_jobs = len(search_results)
+    total_hits = sum(r.get("matches", 0) for r in search_results)
+
+    sections.append(
+        f"=== SEARCH RESULTS: \"{pattern}\" across {folder or '(root)'} ===\n"
+        f"Searched: {len(candidates)} jobs | "
+        f"Matched: {matched_jobs} jobs | "
+        f"Total hits: {total_hits}"
+    )
+
+    for r in search_results:
+        header = (
+            f"\n--- {r['job']} #{r['build']} ({r.get('result', '?')}) "
+            f"— {r['matches']} match{'es' if r['matches'] != 1 else ''} ---"
+        )
+        sections.append(header)
+        for snippet in r.get("snippets", []):
+            sections.append(snippet)
+
+    footer_parts = []
+    if no_match_count:
+        footer_parts.append(f"{no_match_count} jobs had no matches")
+    if skipped_count:
+        footer_parts.append(f"{skipped_count} skipped (match limit reached)")
+    if errors:
+        footer_parts.append(f"{len(errors)} jobs had errors")
+    capped = total_jobs_found - len(candidates)
+    if capped > 0:
+        footer_parts.append(f"{capped} jobs not searched (cap: {_SEARCH_ACROSS_MAX_JOBS})")
+
+    if footer_parts:
+        sections.append(f"\n[{' | '.join(footer_parts)}]")
+
+    if subfolders and not recursive:
+        sections.append(
+            f"{len(subfolders)} subfolders not searched (use recursive=true)"
+        )
+
+    time.sleep(TOOL_DELAY)
+
+    result = "\n".join(sections)
+    result_lines = result.splitlines()
+    if len(result_lines) > _SEARCH_ACROSS_OUTPUT_CAP:
+        result = "\n".join(result_lines[:_SEARCH_ACROSS_OUTPUT_CAP])
+        result += f"\n[Output truncated at {_SEARCH_ACROSS_OUTPUT_CAP} lines]"
     return result
 
 

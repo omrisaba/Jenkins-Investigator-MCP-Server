@@ -20,6 +20,7 @@ from utils.jenkins_api import (
     get_all_nodes,
     get_injected_env_vars,
     get_build_history,
+    get_console_text_tail,
 )
 
 
@@ -340,3 +341,143 @@ class TestBuildHistoryAgent:
         })
         result = get_build_history("job", 1)
         assert result[0]["agent"] == "controller"
+
+
+# ---------------------------------------------------------------------------
+# get_console_text_tail
+# ---------------------------------------------------------------------------
+
+
+class TestGetConsoleTextTail:
+    @patch("utils.jenkins_api.get_console_text")
+    @patch("utils.jenkins_api._get")
+    def test_small_log_falls_back_to_full(self, mock_get, mock_full):
+        """When the log is smaller than max_bytes, fetch the full log."""
+        probe_resp = _mock_response()
+        probe_resp.headers = {"X-Text-Size": "1000"}
+        mock_get.return_value = probe_resp
+        mock_full.return_value = "full log content"
+
+        result = get_console_text_tail("job", 1, max_bytes=5000)
+        assert result == "full log content"
+        mock_full.assert_called_once_with("job", 1)
+
+    @patch("utils.jenkins_api._get")
+    def test_large_log_fetches_tail(self, mock_get):
+        """When the log is larger than max_bytes, fetch only the tail."""
+        probe_resp = _mock_response()
+        probe_resp.headers = {"X-Text-Size": "2000000"}
+
+        tail_resp = MagicMock(spec=requests.Response)
+        tail_resp.status_code = 200
+        tail_resp.raise_for_status.return_value = None
+        tail_resp.text = "tail content here"
+        tail_resp.encoding = None
+
+        mock_get.side_effect = [probe_resp, tail_resp]
+
+        result = get_console_text_tail("job", 42, max_bytes=500_000)
+        assert result == "tail content here"
+
+        tail_call_path = mock_get.call_args_list[1][0][0]
+        assert "progressiveText?start=1500000" in tail_call_path
+
+    @patch("utils.jenkins_api.get_console_text")
+    @patch("utils.jenkins_api._get")
+    def test_probe_failure_falls_back(self, mock_get, mock_full):
+        """When the probe request fails, fall back to full fetch."""
+        mock_get.side_effect = Exception("connection error")
+        mock_full.return_value = "fallback content"
+
+        result = get_console_text_tail("job", 1)
+        assert result == "fallback content"
+
+    @patch("utils.jenkins_api.get_console_text")
+    @patch("utils.jenkins_api._get")
+    def test_tail_failure_falls_back(self, mock_get, mock_full):
+        """When the tail request fails, fall back to full fetch."""
+        probe_resp = _mock_response()
+        probe_resp.headers = {"X-Text-Size": "5000000"}
+        mock_get.side_effect = [probe_resp, Exception("tail failed")]
+        mock_full.return_value = "fallback on tail error"
+
+        result = get_console_text_tail("job", 1, max_bytes=100_000)
+        assert result == "fallback on tail error"
+
+    @patch("utils.jenkins_api.get_console_text")
+    @patch("utils.jenkins_api._get")
+    def test_missing_header_falls_back(self, mock_get, mock_full):
+        """When X-Text-Size header is missing (0), fall back to full fetch."""
+        probe_resp = _mock_response()
+        probe_resp.headers = {}
+        mock_get.return_value = probe_resp
+        mock_full.return_value = "full content"
+
+        result = get_console_text_tail("job", 1)
+        assert result == "full content"
+
+
+# ---------------------------------------------------------------------------
+# get_folder_jobs — include_last_failed parameter
+# ---------------------------------------------------------------------------
+
+
+class TestGetFolderJobsIncludeLastFailed:
+    @patch("utils.jenkins_api._get")
+    def test_includes_last_failed_build(self, mock_get):
+        mock_get.return_value = _mock_response({
+            "jobs": [
+                {
+                    "name": "job1", "color": "red",
+                    "_class": "org.jenkinsci.plugins.workflow.job.WorkflowJob",
+                    "lastBuild": {"number": 50, "result": "FAILURE", "timestamp": 1700000000000},
+                    "lastFailedBuild": {"number": 50},
+                },
+                {
+                    "name": "job2", "color": "blue",
+                    "_class": "org.jenkinsci.plugins.workflow.job.WorkflowJob",
+                    "lastBuild": {"number": 30, "result": "SUCCESS", "timestamp": 1700000000000},
+                    "lastFailedBuild": {"number": 28},
+                },
+            ]
+        })
+        result = get_folder_jobs("my-folder", include_last_failed=True)
+        assert len(result) == 2
+        assert result[0]["last_failed_build_number"] == 50
+        assert result[1]["last_failed_build_number"] == 28
+        assert result[1]["last_build_number"] == 30
+
+    @patch("utils.jenkins_api._get")
+    def test_no_failed_build_returns_none(self, mock_get):
+        mock_get.return_value = _mock_response({
+            "jobs": [{
+                "name": "healthy-job", "color": "blue",
+                "_class": "org.jenkinsci.plugins.workflow.job.WorkflowJob",
+                "lastBuild": {"number": 10, "result": "SUCCESS", "timestamp": 1700000000000},
+                "lastFailedBuild": None,
+            }]
+        })
+        result = get_folder_jobs(include_last_failed=True)
+        assert result[0]["last_failed_build_number"] is None
+        assert result[0]["last_build_number"] == 10
+
+    @patch("utils.jenkins_api._get")
+    def test_tree_query_includes_last_failed(self, mock_get):
+        mock_get.return_value = _mock_response({"jobs": []})
+        get_folder_jobs("org", include_last_failed=True)
+        path = mock_get.call_args[0][0]
+        assert "lastFailedBuild" in path
+
+    @patch("utils.jenkins_api._get")
+    def test_default_excludes_last_failed(self, mock_get):
+        mock_get.return_value = _mock_response({
+            "jobs": [{
+                "name": "job1", "color": "blue",
+                "_class": "org.jenkinsci.plugins.workflow.job.WorkflowJob",
+                "lastBuild": {"number": 10, "result": "SUCCESS", "timestamp": 1700000000000},
+            }]
+        })
+        result = get_folder_jobs("org")
+        assert "last_failed_build_number" not in result[0]
+        path = mock_get.call_args[0][0]
+        assert "lastFailedBuild" not in path

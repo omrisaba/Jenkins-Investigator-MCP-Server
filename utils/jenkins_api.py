@@ -201,6 +201,43 @@ def get_console_text(job_name: str, build_number: int) -> str:
     return "".join(chunks)
 
 
+_TAIL_PROBE_OFFSET = 2_147_483_647
+
+
+def get_console_text_tail(job_name: str, build_number: int,
+                          max_bytes: int = 500_000) -> str:
+    """Fetch only the tail of a console log to save bandwidth.
+
+    Probes log size via Jenkins progressiveText (a request beyond the end
+    returns an empty body but includes X-Text-Size in the response header).
+    If the log is smaller than max_bytes, falls back to get_console_text.
+    """
+    probe_path = (
+        f"{_job_path(job_name)}/{build_number}"
+        f"/logText/progressiveText?start={_TAIL_PROBE_OFFSET}"
+    )
+    try:
+        probe = _get(probe_path)
+        log_size = int(probe.headers.get("X-Text-Size", 0))
+    except Exception:
+        return get_console_text(job_name, build_number)
+
+    if log_size <= max_bytes:
+        return get_console_text(job_name, build_number)
+
+    start = log_size - max_bytes
+    tail_path = (
+        f"{_job_path(job_name)}/{build_number}"
+        f"/logText/progressiveText?start={start}"
+    )
+    try:
+        resp = _get(tail_path)
+        resp.encoding = "utf-8"
+        return resp.text
+    except Exception:
+        return get_console_text(job_name, build_number)
+
+
 def get_test_report(job_name: str, build_number: int) -> dict | None:
     """
     Fetch the JUnit/TestNG test report for a build.
@@ -492,13 +529,21 @@ def get_queue(job_filter: str = "") -> list[dict]:
     return items
 
 
-def get_folder_jobs(folder: str = "") -> list[dict]:
+def get_folder_jobs(folder: str = "", include_last_failed: bool = False) -> list[dict]:
     """List jobs in a Jenkins folder (or root) with last-build status.
 
     Returns up to _MAX_FOLDER_JOBS items.  Includes ``_class`` so callers
     can distinguish real jobs from sub-folders.
+
+    When *include_last_failed* is True the tree query also fetches
+    ``lastFailedBuild[number]`` and each returned dict contains an
+    extra ``last_failed_build_number`` key.
     """
-    tree = "jobs[name,color,url,_class,lastBuild[number,result,timestamp]]"
+    tree = "jobs[name,color,url,_class,lastBuild[number,result,timestamp]"
+    if include_last_failed:
+        tree += ",lastFailedBuild[number]"
+    tree += "]"
+
     if folder:
         path = f"{_job_path(folder)}/api/json?tree={tree}"
     else:
@@ -509,7 +554,7 @@ def get_folder_jobs(folder: str = "") -> list[dict]:
     jobs = []
     for j in all_jobs[:_MAX_FOLDER_JOBS]:
         last = j.get("lastBuild") or {}
-        jobs.append({
+        entry = {
             "name": j.get("name", ""),
             "color": j.get("color", ""),
             "url": j.get("url", ""),
@@ -517,7 +562,11 @@ def get_folder_jobs(folder: str = "") -> list[dict]:
             "last_build_number": last.get("number"),
             "last_result": last.get("result"),
             "last_timestamp": last.get("timestamp"),
-        })
+        }
+        if include_last_failed:
+            last_failed = j.get("lastFailedBuild") or {}
+            entry["last_failed_build_number"] = last_failed.get("number")
+        jobs.append(entry)
 
     if len(all_jobs) > _MAX_FOLDER_JOBS:
         logger.debug("Folder %s has >%d jobs; list truncated", folder or "(root)", _MAX_FOLDER_JOBS)

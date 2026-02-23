@@ -415,3 +415,271 @@ class TestCompareDurationDiff:
 
         result = compare_failing_vs_passing("job")
         assert "DURATION DIFF" not in result
+
+
+# ---------------------------------------------------------------------------
+# search_across_jobs bundle
+# ---------------------------------------------------------------------------
+
+
+def _make_folder_jobs(names_and_colors):
+    """Build a list of job dicts matching get_folder_jobs(include_last_failed=True) output."""
+    jobs = []
+    for name, color, last_bn, result in names_and_colors:
+        jobs.append({
+            "name": name,
+            "color": color,
+            "_class": "org.jenkinsci.plugins.workflow.job.WorkflowJob",
+            "last_build_number": last_bn,
+            "last_result": result,
+            "last_timestamp": 1700000000000,
+            "last_failed_build_number": last_bn if color.startswith("red") else None,
+        })
+    return jobs
+
+
+class TestSearchAcrossJobs:
+    @patch("utils.jenkins_api.get_console_text_tail")
+    @patch("utils.jenkins_api.get_folder_jobs")
+    @patch("server.TOOL_DELAY", 0)
+    def test_finds_matches_across_jobs(self, mock_folder, mock_tail):
+        from server import search_across_jobs
+
+        mock_folder.return_value = _make_folder_jobs([
+            ("job-a", "red", 10, "FAILURE"),
+            ("job-b", "blue", 20, "SUCCESS"),
+            ("job-c", "red", 30, "FAILURE"),
+        ])
+        mock_tail.side_effect = lambda job, bn, max_bytes=500000: {
+            "my-folder/job-a": "line 1\nERROR: NullPointerException\nline 3",
+            "my-folder/job-b": "all good\nno errors here",
+            "my-folder/job-c": "setup\nERROR: NullPointerException in service\ncleanup",
+        }.get(job, "")
+
+        result = search_across_jobs("my-folder", "NullPointerException")
+        assert "Matched: 2 jobs" in result
+        assert "job-a" in result
+        assert "job-c" in result
+        assert "NullPointerException" in result
+
+    @patch("utils.jenkins_api.get_console_text_tail")
+    @patch("utils.jenkins_api.get_folder_jobs")
+    @patch("server.TOOL_DELAY", 0)
+    def test_no_matches_reports_zero(self, mock_folder, mock_tail):
+        from server import search_across_jobs
+
+        mock_folder.return_value = _make_folder_jobs([
+            ("job-a", "blue", 10, "SUCCESS"),
+        ])
+        mock_tail.return_value = "everything is fine\nno problems"
+
+        result = search_across_jobs("my-folder", "FatalCrash")
+        assert "Matched: 0 jobs" in result
+        assert "Total hits: 0" in result
+
+    @patch("utils.jenkins_api.get_console_text_tail")
+    @patch("utils.jenkins_api.get_folder_jobs")
+    @patch("server.TOOL_DELAY", 0)
+    def test_filter_status_failing(self, mock_folder, mock_tail):
+        from server import search_across_jobs
+
+        mock_folder.return_value = _make_folder_jobs([
+            ("failing-job", "red", 10, "FAILURE"),
+            ("passing-job", "blue", 20, "SUCCESS"),
+        ])
+        mock_tail.return_value = "ERROR: something broke"
+
+        result = search_across_jobs(
+            "my-folder", "ERROR", filter_status="failing",
+        )
+        assert "Searched: 1 jobs" in result
+
+    @patch("utils.jenkins_api.get_console_text_tail")
+    @patch("utils.jenkins_api.get_folder_jobs")
+    @patch("server.TOOL_DELAY", 0)
+    def test_filter_status_unstable_and_failing(self, mock_folder, mock_tail):
+        from server import search_across_jobs
+
+        mock_folder.return_value = _make_folder_jobs([
+            ("failing-job", "red", 10, "FAILURE"),
+            ("unstable-job", "yellow", 20, "UNSTABLE"),
+            ("passing-job", "blue", 30, "SUCCESS"),
+        ])
+        mock_tail.return_value = "ERROR: something broke"
+
+        result = search_across_jobs(
+            "my-folder", "ERROR", filter_status="unstable_and_failing",
+        )
+        assert "Searched: 2 jobs" in result
+
+    @patch("utils.jenkins_api.get_console_text_tail")
+    @patch("utils.jenkins_api.get_folder_jobs")
+    @patch("server.TOOL_DELAY", 0)
+    def test_build_selector_last_failed(self, mock_folder, mock_tail):
+        from server import search_across_jobs
+
+        mock_folder.return_value = [{
+            "name": "job-x", "color": "blue",
+            "_class": "org.jenkinsci.plugins.workflow.job.WorkflowJob",
+            "last_build_number": 50,
+            "last_result": "SUCCESS",
+            "last_timestamp": 1700000000000,
+            "last_failed_build_number": 48,
+        }]
+        mock_tail.return_value = "ERROR: old failure"
+
+        result = search_across_jobs(
+            "folder", "ERROR", build_selector="last_failed",
+        )
+        assert "Matched: 1 jobs" in result
+        assert "(FAILURE)" in result
+        assert "(SUCCESS)" not in result
+        mock_tail.assert_called_once_with("folder/job-x", 48, 500000)
+
+    @patch("utils.jenkins_api.get_folder_jobs")
+    @patch("server.TOOL_DELAY", 0)
+    def test_empty_folder(self, mock_folder):
+        from server import search_across_jobs
+
+        mock_folder.return_value = []
+        result = search_across_jobs("empty-folder", "ERROR")
+        assert "No jobs with matching builds" in result
+
+    @patch("utils.jenkins_api.get_console_text_tail")
+    @patch("utils.jenkins_api.get_folder_jobs")
+    @patch("server.TOOL_DELAY", 0)
+    def test_output_cap_enforced(self, mock_folder, mock_tail):
+        from server import search_across_jobs, _SEARCH_ACROSS_OUTPUT_CAP
+
+        mock_folder.return_value = _make_folder_jobs([
+            (f"job-{i}", "red", i + 1, "FAILURE") for i in range(20)
+        ])
+        mock_tail.return_value = "\n".join(
+            [f"ERROR: failure line {i}" for i in range(100)]
+        )
+
+        result = search_across_jobs("big-folder", "ERROR")
+        assert len(result.splitlines()) <= _SEARCH_ACROSS_OUTPUT_CAP + 1
+
+    @patch("utils.jenkins_api.get_console_text_tail")
+    @patch("utils.jenkins_api.get_folder_jobs")
+    @patch("server.TOOL_DELAY", 0)
+    def test_regex_pattern(self, mock_folder, mock_tail):
+        from server import search_across_jobs
+
+        mock_folder.return_value = _make_folder_jobs([
+            ("job-a", "red", 10, "FAILURE"),
+        ])
+        mock_tail.return_value = "NPE at com.example.Foo.bar(Foo.java:42)"
+
+        result = search_across_jobs(
+            "folder", r"NPE at .+\.java:\d+", is_regex=True,
+        )
+        assert "Matched: 1 jobs" in result
+
+    @patch("utils.jenkins_api.get_console_text_tail")
+    @patch("utils.jenkins_api.get_folder_jobs")
+    @patch("server.TOOL_DELAY", 0)
+    def test_fetch_error_counted(self, mock_folder, mock_tail):
+        from server import search_across_jobs
+
+        mock_folder.return_value = _make_folder_jobs([
+            ("broken-job", "red", 10, "FAILURE"),
+        ])
+        mock_tail.side_effect = Exception("timeout")
+
+        result = search_across_jobs("folder", "ERROR")
+        assert "1 jobs had errors" in result
+
+    @patch("utils.jenkins_api.get_console_text_tail")
+    @patch("utils.jenkins_api.get_folder_jobs")
+    @patch("server.TOOL_DELAY", 0)
+    def test_adjacent_matches_merged(self, mock_folder, mock_tail):
+        """Two matches 1 line apart should produce a single merged snippet."""
+        from server import search_across_jobs
+
+        mock_folder.return_value = _make_folder_jobs([
+            ("job-a", "red", 10, "FAILURE"),
+        ])
+        lines = ["ok"] * 10
+        lines[4] = "ERROR: first problem"
+        lines[5] = "ERROR: second problem"
+        mock_tail.return_value = "\n".join(lines)
+
+        result = search_across_jobs("folder", "ERROR", context_lines=2)
+        snippets = [l for l in result.splitlines() if l.startswith(">>>") or l.startswith("   ")]
+        line_numbers = []
+        for s in snippets:
+            parts = s.strip().split("L", 1)
+            if len(parts) > 1:
+                ln = parts[1].split(":")[0]
+                line_numbers.append(int(ln))
+        assert line_numbers, "Expected snippet lines in output"
+        assert len(line_numbers) == len(set(line_numbers)), "Merged snippet should have no duplicate lines"
+
+    @patch("utils.jenkins_api.get_console_text_tail")
+    @patch("utils.jenkins_api.get_folder_jobs")
+    @patch("server._SEARCH_ACROSS_MAX_JOBS", 2)
+    @patch("server.TOOL_DELAY", 0)
+    def test_failing_jobs_searched_first(self, mock_folder, mock_tail):
+        """When capped, failing/unstable jobs should be searched over passing ones."""
+        from server import search_across_jobs
+
+        mock_folder.return_value = _make_folder_jobs([
+            ("passing-job", "blue", 20, "SUCCESS"),
+            ("failing-job", "red", 10, "FAILURE"),
+            ("unstable-job", "yellow", 30, "UNSTABLE"),
+        ])
+        mock_tail.return_value = "ERROR: found it"
+
+        result = search_across_jobs("folder", "ERROR")
+        assert "Searched: 2 jobs" in result
+        assert "failing-job" in result
+        assert "unstable-job" in result
+        assert "passing-job" not in result.split("===")[1]
+        assert "1 jobs not searched" in result
+
+    @patch("utils.jenkins_api.get_console_text_tail")
+    @patch("utils.jenkins_api.get_folder_jobs")
+    @patch("server.TOOL_DELAY", 0)
+    def test_recursive_searches_subfolders(self, mock_folder, mock_tail):
+        from server import search_across_jobs
+
+        root_jobs = [
+            {
+                "name": "sub1", "color": "", "_class": "com.cloudbees.hudson.plugins.folder.Folder",
+                "last_build_number": None, "last_result": None,
+                "last_timestamp": None, "last_failed_build_number": None,
+            },
+        ]
+        sub_jobs = _make_folder_jobs([
+            ("nested-job", "red", 5, "FAILURE"),
+        ])
+
+        mock_folder.side_effect = [root_jobs, sub_jobs]
+        mock_tail.return_value = "ERROR: nested error"
+
+        result = search_across_jobs("parent", "ERROR", recursive=True)
+        assert "nested-job" in result
+        assert "Matched: 1 jobs" in result
+        assert mock_folder.call_count == 2
+        mock_folder.assert_any_call("parent/sub1", include_last_failed=True)
+
+    @patch("utils.jenkins_api.get_console_text_tail")
+    @patch("utils.jenkins_api.get_folder_jobs")
+    @patch("server.TOOL_DELAY", 0)
+    def test_subfolder_hint_when_not_recursive(self, mock_folder, mock_tail):
+        from server import search_across_jobs
+
+        mock_folder.return_value = [
+            {
+                "name": "sub1", "color": "", "_class": "com.cloudbees.hudson.plugins.folder.Folder",
+                "last_build_number": None, "last_result": None,
+                "last_timestamp": None, "last_failed_build_number": None,
+            },
+        ] + _make_folder_jobs([("job-a", "red", 10, "FAILURE")])
+        mock_tail.return_value = "ERROR: something"
+
+        result = search_across_jobs("parent", "ERROR", recursive=False)
+        assert "subfolders not searched" in result
+        assert "recursive=true" in result
