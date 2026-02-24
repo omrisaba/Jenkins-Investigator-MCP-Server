@@ -205,16 +205,16 @@ def _scan(
     if not match_data:
         return []
 
-    raw_ranges: list[tuple[int, int, str, str]] = []
+    raw_ranges: list[tuple[int, int, str, str, int]] = []
     for idx, tier, raw_line in match_data:
         start = max(0, idx - context_lines)
         end = min(len(lines) - 1, idx + context_lines)
-        raw_ranges.append((start, end, tier, raw_line))
+        raw_ranges.append((start, end, tier, raw_line, idx))
 
     merged: list[MatchedSection] = []
-    for start, end, tier, raw_line in raw_ranges:
+    for start, end, tier, raw_line, match_idx in raw_ranges:
         key = _normalize_key(raw_line)
-        phase = _resolve_stage(stage_index, start + context_lines)
+        phase = _resolve_stage(stage_index, match_idx)
 
         if merged and start <= merged[-1].end + 1:
             prev = merged[-1]

@@ -9,39 +9,48 @@ import logging
 import os
 import re
 import time
+from functools import lru_cache
 from urllib.parse import quote
 
 import requests
 from dotenv import load_dotenv
 
-load_dotenv()
-
 logger = logging.getLogger(__name__)
 
-_JENKINS_URL = os.environ.get("JENKINS_URL", "").rstrip("/")
-_JENKINS_USER = os.environ.get("JENKINS_USER", "")
-_JENKINS_TOKEN = os.environ.get("JENKINS_TOKEN", "")
-
-_MISSING = [k for k, v in {
-    "JENKINS_URL": _JENKINS_URL,
-    "JENKINS_USER": _JENKINS_USER,
-    "JENKINS_TOKEN": _JENKINS_TOKEN,
-}.items() if not v]
-
-if _MISSING:
-    raise EnvironmentError(
-        f"Missing required environment variables: {', '.join(_MISSING)}. "
-        "Copy .env.example to .env and fill in your credentials."
-    )
-
-_AUTH = (_JENKINS_USER, _JENKINS_TOKEN)
+_JENKINS_URL: str = ""
+_JENKINS_USER: str = ""
+_JENKINS_TOKEN: str = ""
+_AUTH: tuple[str, str] = ("", "")
+_VERIFY_SSL: bool = True
+_configured = False
 _TIMEOUT = 30
 
-_VERIFY_SSL = os.environ.get("JENKINS_VERIFY_SSL", "true").lower() not in ("false", "0", "no")
 
-if not _VERIFY_SSL:
-    import urllib3
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+def _ensure_config() -> None:
+    """Lazy one-shot config loader — validates env vars on first API call."""
+    global _JENKINS_URL, _JENKINS_USER, _JENKINS_TOKEN, _AUTH, _VERIFY_SSL, _configured
+    if _configured:
+        return
+    load_dotenv()
+    _JENKINS_URL = os.environ.get("JENKINS_URL", "").rstrip("/")
+    _JENKINS_USER = os.environ.get("JENKINS_USER", "")
+    _JENKINS_TOKEN = os.environ.get("JENKINS_TOKEN", "")
+    missing = [k for k, v in {
+        "JENKINS_URL": _JENKINS_URL,
+        "JENKINS_USER": _JENKINS_USER,
+        "JENKINS_TOKEN": _JENKINS_TOKEN,
+    }.items() if not v]
+    if missing:
+        raise EnvironmentError(
+            f"Missing required environment variables: {', '.join(missing)}. "
+            "Copy .env.example to .env and fill in your credentials."
+        )
+    _AUTH = (_JENKINS_USER, _JENKINS_TOKEN)
+    _VERIFY_SSL = os.environ.get("JENKINS_VERIFY_SSL", "true").lower() not in ("false", "0", "no")
+    if not _VERIFY_SSL:
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    _configured = True
 
 _MAX_LOG_BYTES = 10 * 1024 * 1024   # 10 MB
 _MAX_ARTIFACT_BYTES = 50 * 1024     # 50 KB — artifact content goes into context window
@@ -73,6 +82,7 @@ _BINARY_EXTENSIONS = frozenset({
 
 def _get(path: str, **kwargs) -> requests.Response:
     """HTTP GET with bounded retry for transient failures (429/502/503/504)."""
+    _ensure_config()
     url = f"{_JENKINS_URL}{path}"
     for attempt in range(_MAX_RETRIES + 1):
         try:
@@ -148,12 +158,15 @@ def get_named_build(job_name: str, selector: str = "last_failed") -> dict:
     return {k: v for k, v in data.items() if k in keep}
 
 
+@lru_cache(maxsize=64)
 def get_build(job_name: str, build_number: int) -> dict:
     """
     Fetch build metadata and prune it to only the fields the AI needs.
 
     Returns a dict with keys: result, duration, timestamp, builtOn,
     changeSet/changeSets (whichever exists), and actions.
+
+    Cached: callers must not mutate the returned dict.
     """
     path = f"{_job_path(job_name)}/{build_number}/api/json"
     data = _get(path).json()
@@ -189,16 +202,21 @@ def get_console_text(job_name: str, build_number: int) -> str:
     """Fetch the console log for a build, streaming and capping at 10 MB."""
     path = f"{_job_path(job_name)}/{build_number}/consoleText"
     response = _get(path, stream=True)
-    chunks: list[str] = []
+    chunks: list[bytes] = []
     total = 0
-    for chunk in response.iter_content(chunk_size=8192, decode_unicode=True):
-        total += len(chunk)
-        chunks.append(chunk)
-        if total >= _MAX_LOG_BYTES:
-            chunks.append("\n[LOG TRUNCATED: exceeded 10 MB download limit]")
-            break
-    response.close()
-    return "".join(chunks)
+    try:
+        for chunk in response.iter_content(chunk_size=8192):
+            total += len(chunk)
+            chunks.append(chunk)
+            if total >= _MAX_LOG_BYTES:
+                break
+    finally:
+        response.close()
+
+    text = b"".join(chunks).decode("utf-8", errors="replace")
+    if total >= _MAX_LOG_BYTES:
+        text += "\n[LOG TRUNCATED: exceeded 10 MB download limit]"
+    return text
 
 
 _TAIL_PROBE_OFFSET = 2_147_483_647
@@ -238,6 +256,22 @@ def get_console_text_tail(job_name: str, build_number: int,
         return get_console_text(job_name, build_number)
 
 
+def _smart_truncate_stack(trace: str, max_chars: int = 400) -> str:
+    """Keep diagnostically useful parts of a stack trace: first 2 lines + Caused-by chains."""
+    if not trace or len(trace) <= max_chars:
+        return trace
+    lines = trace.splitlines()
+    kept: list[str] = []
+    kept.extend(lines[:2])
+    for line in lines[2:]:
+        if "Caused by:" in line:
+            kept.append(line)
+    result = "\n".join(kept)
+    if len(result) > max_chars:
+        result = result[:max_chars] + "..."
+    return result
+
+
 def get_test_report(job_name: str, build_number: int) -> dict | None:
     """
     Fetch the JUnit/TestNG test report for a build.
@@ -261,7 +295,9 @@ def get_test_report(job_name: str, build_number: int) -> dict | None:
                     "class_name": case.get("className", ""),
                     "test_name": case.get("name", ""),
                     "error_details": (case.get("errorDetails") or "")[:500],
-                    "error_stack_trace": (case.get("errorStackTrace") or "")[:1000],
+                    "error_stack_trace": _smart_truncate_stack(
+                        (case.get("errorStackTrace") or "")[:1000]
+                    ),
                 })
 
     return {
@@ -456,12 +492,14 @@ def get_artifact_content(
 
     raw_chunks: list[bytes] = []
     total = 0
-    for chunk in response.iter_content(chunk_size=8192):
-        total += len(chunk)
-        raw_chunks.append(chunk)
-        if total >= max_bytes:
-            break
-    response.close()
+    try:
+        for chunk in response.iter_content(chunk_size=8192):
+            total += len(chunk)
+            raw_chunks.append(chunk)
+            if total >= max_bytes:
+                break
+    finally:
+        response.close()
 
     raw = b"".join(raw_chunks)
 
@@ -482,6 +520,63 @@ def get_artifact_content(
 
 
 # ---------------------------------------------------------------------------
+# JUnit XML artifact discovery
+# ---------------------------------------------------------------------------
+
+
+_JUNIT_PATH_RE = re.compile(
+    r'(?:'
+    r'TEST-[^/]+\.xml'
+    r'|surefire-reports/.*\.xml'
+    r'|failsafe-reports/.*\.xml'
+    r'|test-results?/.*\.xml'
+    r'|junit[^/]*\.xml'
+    r'|xunit[^/]*\.xml'
+    r')$',
+    re.IGNORECASE,
+)
+
+_MAX_JUNIT_XML_BYTES = 200 * 1024  # 200 KB — parsed, not dumped into context
+
+
+def discover_junit_artifacts(job_name: str, build_number: int) -> list[dict]:
+    """Find build artifacts that match common JUnit XML naming conventions."""
+    artifacts = get_artifacts_list(job_name, build_number)
+    return [a for a in artifacts if _JUNIT_PATH_RE.search(a["relative_path"])]
+
+
+def get_artifact_content_raw(
+    job_name: str,
+    build_number: int,
+    artifact_path: str,
+    max_bytes: int = _MAX_JUNIT_XML_BYTES,
+) -> str | None:
+    """Fetch an artifact as text, with a custom byte limit.
+
+    Returns None if the content cannot be decoded as UTF-8.
+    """
+    encoded_path = "/".join(quote(seg, safe="") for seg in artifact_path.split("/"))
+    path = f"{_job_path(job_name)}/{build_number}/artifact/{encoded_path}"
+    response = _get(path, stream=True)
+
+    try:
+        raw_chunks: list[bytes] = []
+        total = 0
+        for chunk in response.iter_content(chunk_size=8192):
+            total += len(chunk)
+            raw_chunks.append(chunk)
+            if total >= max_bytes:
+                break
+    finally:
+        response.close()
+
+    try:
+        return b"".join(raw_chunks).decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Job configuration
 # ---------------------------------------------------------------------------
 
@@ -490,16 +585,21 @@ def get_job_config_xml(job_name: str, max_bytes: int = _MAX_CONFIG_BYTES) -> str
     """Fetch the raw config.xml for a job, capped to max_bytes."""
     path = f"{_job_path(job_name)}/config.xml"
     response = _get(path, stream=True)
-    chunks: list[str] = []
+    chunks: list[bytes] = []
     total = 0
-    for chunk in response.iter_content(chunk_size=8192, decode_unicode=True):
-        total += len(chunk)
-        chunks.append(chunk)
-        if total >= max_bytes:
-            chunks.append("\n<!-- CONFIG TRUNCATED -->")
-            break
-    response.close()
-    return "".join(chunks)
+    try:
+        for chunk in response.iter_content(chunk_size=8192):
+            total += len(chunk)
+            chunks.append(chunk)
+            if total >= max_bytes:
+                break
+    finally:
+        response.close()
+
+    text = b"".join(chunks).decode("utf-8", errors="replace")
+    if total >= max_bytes:
+        text += "\n<!-- CONFIG TRUNCATED -->"
+    return text
 
 
 # ---------------------------------------------------------------------------

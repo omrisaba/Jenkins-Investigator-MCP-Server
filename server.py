@@ -19,12 +19,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 import requests
-from dotenv import load_dotenv
 from fastmcp import FastMCP
 
-from utils import jenkins_api, log_parser, scm
-
-load_dotenv()
+from utils import jenkins_api, junit_parser, log_parser, scm
 
 # Route all library and application logs to stderr, never stdout.
 logging.basicConfig(
@@ -34,7 +31,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("jenkins-mcp")
 
-TOOL_DELAY = float(os.getenv("TOOL_DELAY_SECONDS", "2"))
+TOOL_DELAY = float(os.getenv("TOOL_DELAY_SECONDS", "0.5"))
 
 mcp = FastMCP(
     "Jenkins Investigator",
@@ -48,7 +45,13 @@ mcp = FastMCP(
         "search_console_log to grep for a pattern, get_build_artifacts for artifacts. "
         "Use list_jobs to discover jobs, triage_folder for team health. "
         "Use analyze_flaky_job for intermittent failures, diagnose_infrastructure_issue for node problems. "
-        "Use deep_dive_test_failures to find which commit broke which test. "
+        "Use deep_dive_test_failures to find which commit broke which test — "
+        "it also enriches results with JUnit XML artifacts when available, providing "
+        "failure classification (assertion vs exception), blast-radius detection, "
+        "and extended stdout/stderr context. When XML enrichment shows a blast radius, "
+        "treat it as a single root cause rather than N independent failures. "
+        "When classification shows mostly exceptions, prioritize infrastructure investigation; "
+        "when mostly assertions, focus on code logic changes. "
         "Only fall back to get_error_logs, get_build_summary, get_pipeline_stages, etc. "
         "when you need a single focused piece of data."
     ),
@@ -1084,10 +1087,214 @@ def get_node_status(node_name: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Bundle Tools — multi-call composites that call API wrappers directly
+# JUnit XML enrichment helper
 # ---------------------------------------------------------------------------
 
-_BUNDLE_PACING = 0.05  # seconds between sub-calls to avoid hammering Jenkins
+_BUNDLE_PACING = float(os.getenv("BUNDLE_PACING_SECONDS", "0.05"))
+
+_XML_MAX_ARTIFACTS = 8
+_XML_ENRICHMENT_BUDGET = 80
+_XML_OUTPUT_LINE_CAP = 300
+_XML_DETAIL_EXTENSION = 500
+
+
+def _enrich_with_junit_xml(
+    job_name: str,
+    build_number: int,
+    failing_class_names: set[str],
+    budget_lines: int = _XML_ENRICHMENT_BUDGET,
+    max_artifacts: int = _XML_MAX_ARTIFACTS,
+) -> str | None:
+    """Fetch and parse JUnit XML artifacts, returning a formatted enrichment
+    block with provenance, classification, blast radius, and extended detail.
+
+    Returns None when no JUnit XML artifacts are found or parseable.
+    """
+    try:
+        xml_artifacts = jenkins_api.discover_junit_artifacts(job_name, build_number)
+    except Exception:
+        logger.debug("XML enrichment: artifact discovery failed for %s #%s", job_name, build_number, exc_info=True)
+        return None
+
+    if not xml_artifacts:
+        return None
+
+    # Prioritise artifacts whose filename contains a failing class name
+    def _priority(artifact: dict) -> int:
+        path = artifact["relative_path"]
+        for cls in failing_class_names:
+            short = cls.rsplit(".", 1)[-1]
+            if short in path:
+                return 0
+        return 1
+
+    xml_artifacts.sort(key=_priority)
+    candidates = xml_artifacts[:max_artifacts]
+
+    # Fetch and parse
+    parsed_suites: list[dict] = []
+    provenance: list[dict] = []
+    total_artifacts = len(xml_artifacts)
+
+    for artifact in candidates:
+        time.sleep(_BUNDLE_PACING)
+        try:
+            content = jenkins_api.get_artifact_content_raw(
+                job_name, build_number, artifact["relative_path"],
+            )
+        except Exception:
+            logger.debug("XML enrichment: failed to fetch %s", artifact["relative_path"], exc_info=True)
+            provenance.append({
+                "path": artifact["relative_path"],
+                "status": "fetch_error",
+            })
+            continue
+
+        if content is None:
+            provenance.append({
+                "path": artifact["relative_path"],
+                "status": "decode_error",
+            })
+            continue
+
+        suites = junit_parser.parse_junit_xml(content)
+        if suites is None:
+            provenance.append({
+                "path": artifact["relative_path"],
+                "status": "not_junit",
+            })
+            continue
+
+        total_tests = sum(s["suite_tests"] for s in suites)
+        total_failed = sum(
+            1 for s in suites for c in s["cases"]
+            if c["status"] in ("failed", "errored")
+        )
+
+        provenance.append({
+            "path": artifact["relative_path"],
+            "status": "parsed",
+            "tests": total_tests,
+            "failed": total_failed,
+        })
+        parsed_suites.extend(suites)
+
+    parsed_count = sum(1 for p in provenance if p["status"] == "parsed")
+    if parsed_count == 0:
+        return None
+
+    # Build output
+    lines: list[str] = []
+
+    # --- Provenance ---
+    lines.append(
+        f"=== XML TEST DETAIL ({parsed_count} of {total_artifacts} artifacts parsed) ==="
+    )
+    lines.append("Sources:")
+    for p in provenance:
+        if p["status"] == "parsed":
+            suffix = f'{p["tests"]} tests, {p["failed"]} failed'
+            if p["failed"] == 0:
+                suffix += "  [no failures]"
+            lines.append(f"  [PARSED] {p['path']}  ({suffix})")
+        elif p["status"] == "not_junit":
+            lines.append(f"  [SKIP]   {p['path']}  (not JUnit format)")
+        else:
+            lines.append(f"  [SKIP]   {p['path']}  ({p['status']})")
+
+    not_fetched = total_artifacts - len(candidates)
+    if not_fetched > 0:
+        lines.append(f"  Not fetched: {not_fetched} artifacts (cap reached)")
+
+    # --- Classification ---
+    classification = junit_parser.classify_failures(parsed_suites)
+    if classification["total_failed"] > 0:
+        lines.append("")
+        lines.append(
+            f"Classification: {classification['assertions']} assertion failure(s), "
+            f"{classification['exceptions']} unhandled exception(s)"
+        )
+
+    # --- Blast radius ---
+    blasts = junit_parser.detect_blast_radius(parsed_suites)
+    blast_test_names: set[str] = set()
+
+    for blast in blasts:
+        lines.append("")
+        lines.append(
+            f"Blast radius: {blast['suite_name']} "
+            f"({blast['shared_count']}/{blast['total_failures']} failures)"
+        )
+        msg = blast["shared_message"]
+        lines.append(f"  Shared error: {msg}")
+        if blast["suite_stderr"]:
+            stderr_preview = blast["suite_stderr"].strip().splitlines()
+            for sl in stderr_preview[:3]:
+                lines.append(f"  Suite stderr: {sl[:200]}")
+        affected = ", ".join(blast["affected_tests"][:10])
+        if len(blast["affected_tests"]) > 10:
+            affected += f", ... +{len(blast['affected_tests']) - 10} more"
+        lines.append(f"  Affected: {affected}")
+        blast_test_names.update(blast["affected_qualified_names"])
+
+    # --- Extended detail for non-blast failures ---
+    non_blast_failures: list[tuple[dict, dict]] = []
+    for suite in parsed_suites:
+        for case in suite["cases"]:
+            if case["status"] not in ("failed", "errored"):
+                continue
+            fqn_key = f"{case['class_name']}.{case['name']}" if case["class_name"] else case["name"]
+            if fqn_key in blast_test_names:
+                continue
+            non_blast_failures.append((suite, case))
+
+    if non_blast_failures and len(lines) < budget_lines - 5:
+        lines.append("")
+        count_label = len(non_blast_failures)
+        lines.append(f"Extended detail ({count_label} non-blast failure(s)):")
+
+        for suite, case in non_blast_failures:
+            if len(lines) >= budget_lines - 4:
+                lines.append("  [budget reached — remaining failures omitted]")
+                break
+
+            fqn = f"{case['class_name']}.{case['name']}" if case["class_name"] else case["name"]
+            lines.append(f"  {fqn}")
+            lines.append(f"    Type: {case['kind']} | Time: {case['time_s']}s")
+
+            if case["stdout"]:
+                stdout_lines = case["stdout"].strip().splitlines()
+                for sl in stdout_lines[-3:]:
+                    lines.append(f"    stdout: {sl[:_XML_OUTPUT_LINE_CAP]}")
+
+            if case["stderr"]:
+                stderr_lines = case["stderr"].strip().splitlines()
+                for sl in stderr_lines[-3:]:
+                    lines.append(f"    stderr: {sl[:_XML_OUTPUT_LINE_CAP]}")
+
+            if case["message"]:
+                lines.append(f"    Message: {case['message'][:300]}")
+
+            if case["detail"] and len(case["detail"]) > 200:
+                caused_by = [
+                    l for l in case["detail"].splitlines()
+                    if "Caused by:" in l
+                ]
+                if caused_by:
+                    for cb in caused_by[:3]:
+                        lines.append(f"    {cb.strip()[:_XML_DETAIL_EXTENSION]}")
+
+    # Apply budget
+    if len(lines) > budget_lines:
+        lines = lines[:budget_lines]
+        lines.append(f"[XML enrichment truncated at {budget_lines} lines]")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Bundle Tools — multi-call composites that call API wrappers directly
+# ---------------------------------------------------------------------------
 
 _INVESTIGATE_BUDGET = {
     "error": 150,
@@ -1147,10 +1354,34 @@ def investigate_build_failure(job_name: str, selector: str = "last_failed") -> s
         f"Trigger: {triggered_by}"
     )
 
-    # --- Pipeline Stages ---
-    time.sleep(_BUNDLE_PACING)
+    # --- Parallel fetch: stages, error log, test report, history ---
+    def _fetch_error_summary() -> str:
+        """Hybrid: try tail first (500 KB), fall back to full log if no errors."""
+        console_text = jenkins_api.get_console_text_tail(job_name, build_number)
+        extract = log_parser.get_error_log(
+            console_text,
+            max_lines=_INVESTIGATE_BUDGET["error"],
+            hard_limit=_INVESTIGATE_BUDGET["error"] + 20,
+            include_head=True, include_tail=True,
+        )
+        if not extract or "[No significant errors" in extract:
+            console_text = jenkins_api.get_console_text(job_name, build_number)
+            extract = log_parser.get_error_log(
+                console_text,
+                max_lines=_INVESTIGATE_BUDGET["error"],
+                hard_limit=_INVESTIGATE_BUDGET["error"] + 20,
+                include_head=True, include_tail=True,
+            )
+        return extract
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        stages_f = executor.submit(jenkins_api.get_pipeline_stages, job_name, build_number)
+        error_f = executor.submit(_fetch_error_summary)
+        test_f = executor.submit(jenkins_api.get_test_report, job_name, build_number)
+        history_f = executor.submit(jenkins_api.get_build_history, job_name, 10)
+
     try:
-        stages = jenkins_api.get_pipeline_stages(job_name, build_number)
+        stages = stages_f.result()
     except Exception:
         stages = None
 
@@ -1162,24 +1393,15 @@ def investigate_build_failure(job_name: str, selector: str = "last_failed") -> s
         sections.append("\n".join(stage_lines))
 
     # --- Error Summary ---
-    time.sleep(_BUNDLE_PACING)
     try:
-        console_text = jenkins_api.get_console_text(job_name, build_number)
-        error_extract = log_parser.get_error_log(
-            console_text,
-            max_lines=_INVESTIGATE_BUDGET["error"],
-            hard_limit=_INVESTIGATE_BUDGET["error"] + 20,
-            include_head=True,
-            include_tail=True,
-        )
+        error_extract = error_f.result()
         sections.append(f"=== ERROR SUMMARY ===\n{error_extract}")
     except Exception:
         sections.append("=== ERROR SUMMARY ===\n[Console log unavailable]")
 
     # --- Test Failures ---
-    time.sleep(_BUNDLE_PACING)
     try:
-        report = jenkins_api.get_test_report(job_name, build_number)
+        report = test_f.result()
     except Exception:
         report = None
 
@@ -1195,6 +1417,16 @@ def investigate_build_failure(job_name: str, selector: str = "last_failed") -> s
         if len(report["failing_tests"]) > _INVESTIGATE_MAX_TESTS:
             test_lines.append(f"  ... and {len(report['failing_tests']) - _INVESTIGATE_MAX_TESTS} more failing tests")
         sections.append("\n".join(test_lines))
+
+    # --- Lightweight JUnit XML enrichment ---
+    if report is not None and report["failing_tests"]:
+        failing_classes = {t["class_name"] for t in report["failing_tests"]}
+        xml_enrichment = _enrich_with_junit_xml(
+            job_name, build_number, failing_classes,
+            budget_lines=40, max_artifacts=3,
+        )
+        if xml_enrichment:
+            sections.append(xml_enrichment)
 
     # --- SCM Changes (reuses data from build_data) ---
     commits = scm.extract_changesets(build_data)
@@ -1215,9 +1447,8 @@ def investigate_build_failure(job_name: str, selector: str = "last_failed") -> s
         sections.append("\n".join(param_lines))
 
     # --- Build Trend ---
-    time.sleep(_BUNDLE_PACING)
     try:
-        history = jenkins_api.get_build_history(job_name, 10)
+        history = history_f.result()
     except Exception:
         history = []
 
@@ -1309,15 +1540,16 @@ def compare_failing_vs_passing(job_name: str, failing_build: int = 0) -> str:
         f"Gap: {failing_build - last_pass['number'] - 1} build(s) between them"
     )
 
-    # Fetch full build data for both
-    time.sleep(_BUNDLE_PACING)
+    # Fetch full build data for both (parallel)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        fail_f = executor.submit(jenkins_api.get_build, job_name, failing_build)
+        pass_f = executor.submit(jenkins_api.get_build, job_name, last_pass["number"])
     try:
-        fail_data = jenkins_api.get_build(job_name, failing_build)
+        fail_data = fail_f.result()
     except Exception:
         fail_data = {}
-    time.sleep(_BUNDLE_PACING)
     try:
-        pass_data = jenkins_api.get_build(job_name, last_pass["number"])
+        pass_data = pass_f.result()
     except Exception:
         pass_data = {}
 
@@ -1450,13 +1682,20 @@ def deep_dive_test_failures(job_name: str, build_number: int) -> str:
 
     prev_builds = [b for b in history if b["number"] < build_number][:_DEEP_DIVE_HISTORY_DEPTH]
 
-    for b in prev_builds:
-        time.sleep(_BUNDLE_PACING)
-        try:
-            r = jenkins_api.get_test_report(job_name, b["number"])
-        except Exception:
-            r = None
-        prev_reports.append((b["number"], r))
+    if prev_builds:
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = {
+                executor.submit(jenkins_api.get_test_report, job_name, b["number"]): b["number"]
+                for b in prev_builds
+            }
+            for future in as_completed(futures):
+                bn = futures[future]
+                try:
+                    r = future.result()
+                except Exception:
+                    r = None
+                prev_reports.append((bn, r))
+        prev_reports.sort(key=lambda x: x[0], reverse=True)
 
     # --- Pass 1: determine regression build for each test ---
     test_analysis: list[dict] = []
@@ -1549,11 +1788,28 @@ def deep_dive_test_failures(job_name: str, build_number: int) -> str:
                 test_lines.append(f"  Suspect commit (build #{regression_build}):")
                 for c in commits[:3]:
                     test_lines.append(f"    [{c['commit_id']}] {c['author']}: {c['message'][:80]}")
+                    if c.get("affected_paths"):
+                        test_class_short = key.rsplit(".", 1)[-1].lower()
+                        relevant = [p for p in c["affected_paths"] if test_class_short in p.lower()]
+                        if relevant:
+                            for p in relevant[:3]:
+                                test_lines.append(f"      -> {p}")
+                        elif len(c["affected_paths"]) <= 5:
+                            for p in c["affected_paths"]:
+                                test_lines.append(f"      -> {p}")
 
         sections.append("\n".join(test_lines))
 
     if len(report["failing_tests"]) > _DEEP_DIVE_MAX_TESTS:
         sections.append(f"\n[{len(report['failing_tests']) - _DEEP_DIVE_MAX_TESTS} more failing tests not analyzed]")
+
+    # --- Pass 3: JUnit XML enrichment (best-effort) ---
+    failing_classes = {entry["test"]["class_name"] for entry in test_analysis}
+    xml_enrichment = _enrich_with_junit_xml(
+        job_name, build_number, failing_classes,
+    )
+    if xml_enrichment:
+        sections.append(xml_enrichment)
 
     time.sleep(TOOL_DELAY)
 
@@ -1738,6 +1994,7 @@ def diagnose_infrastructure_issue(job_name: str, build_number: int) -> str:
     )
 
     # Node health
+    node_info = None
     time.sleep(_BUNDLE_PACING)
     try:
         node_info = jenkins_api.get_node_info(agent)
@@ -1805,7 +2062,7 @@ def diagnose_infrastructure_issue(job_name: str, build_number: int) -> str:
                 f"Node '{agent}' has a {this_rate:.0%} failure rate vs fleet average {global_rate:.0%} "
                 f"— likely infrastructure-related."
             )
-        elif not node_info.get("online", True) if 'node_info' in dir() else False:
+        elif node_info is not None and not node_info.get("online", True):
             verdict = f"Node '{agent}' is OFFLINE — likely infrastructure-related."
         else:
             verdict = f"Node '{agent}' failure rate ({this_rate:.0%}) is within normal range — likely not infra-related."

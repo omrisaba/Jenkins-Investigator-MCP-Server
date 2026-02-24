@@ -18,9 +18,10 @@ Bundles combine multiple API calls into a single tool invocation, saving tokens 
 |--------|-------------|
 | `investigate_build_failure` | **Primary entry point.** Returns build info, stages, errors, tests, commits, params, and trend in one call. |
 | `compare_failing_vs_passing` | Diffs the last failing vs last passing build: parameter changes, agent, trigger, cumulative commits. |
-| `deep_dive_test_failures` | Traces each failing test back through recent builds to find the regression point and suspect commit. |
+| `deep_dive_test_failures` | Traces each failing test back through recent builds to find the regression point and suspect commit. Enriches with JUnit XML artifacts when available (failure classification, blast-radius detection, extended stdout/stderr). |
 | `analyze_flaky_job` | Scores flakiness and clusters failures by node, stage, and time of day. |
 | `diagnose_infrastructure_issue` | Checks node health and per-node failure correlation to determine if a failure is infra-related. |
+| `search_across_jobs` | Searches console logs across all jobs in a folder for a specific error pattern. Concurrent, with status filtering and early termination. |
 | `triage_folder` | Scans a folder for broken jobs with consecutive-failure counts — a team health dashboard. |
 
 ### Individual Tools
@@ -159,16 +160,17 @@ See [Tool Flow](docs/tool-flow.md) for decision trees, bundle internals, and per
 
 ```
 jenkins-mcp/
-├── server.py          # FastMCP server — 20 individual tools + 6 bundles
+├── server.py          # FastMCP server — 20 individual tools + 7 bundles
 ├── utils/
 │   ├── __init__.py
 │   ├── jenkins_api.py # Jenkins REST wrappers with retry/backoff
+│   ├── junit_parser.py# JUnit XML parser (assertion vs exception classification, blast radius)
 │   ├── log_parser.py  # Priority-budgeted error extraction
 │   └── scm.py         # changeSet/changeSets normalization across SCMs
 ├── docs/
 │   ├── architecture.md # System design and layer diagrams
 │   └── tool-flow.md    # Decision trees and bundle internals
-├── tests/             # pytest suite (101 tests)
+├── tests/             # pytest suite (162 tests)
 ├── .env               # Your credentials (gitignored)
 ├── .env.example       # Template
 ├── .gitignore

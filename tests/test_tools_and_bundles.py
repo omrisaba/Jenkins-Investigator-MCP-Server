@@ -253,6 +253,7 @@ def _make_test_report(failing_keys: list[str], pass_count: int = 10) -> dict:
     }
 
 
+@patch("server._enrich_with_junit_xml", return_value=None)
 class TestDeepDiveRegression:
     """Verify regression detection identifies the correct PASS→FAIL transition."""
 
@@ -261,7 +262,7 @@ class TestDeepDiveRegression:
     @patch("utils.jenkins_api.get_build_history")
     @patch("server.TOOL_DELAY", 0)
     @patch("server._BUNDLE_PACING", 0)
-    def test_pass_to_fail_transition(self, mock_history, mock_test_report, mock_get_build):
+    def test_pass_to_fail_transition(self, mock_history, mock_test_report, mock_get_build, _mock_xml):
         """Test passes in 97-98, fails in 99-100.  Regression should be build #99."""
         from server import deep_dive_test_failures
 
@@ -298,7 +299,7 @@ class TestDeepDiveRegression:
     @patch("utils.jenkins_api.get_build_history")
     @patch("server.TOOL_DELAY", 0)
     @patch("server._BUNDLE_PACING", 0)
-    def test_all_failing_persistent(self, mock_history, mock_test_report, mock_get_build):
+    def test_all_failing_persistent(self, mock_history, mock_test_report, mock_get_build, _mock_xml):
         """Test fails in all prior builds.  Should report 'Persistent failure'."""
         from server import deep_dive_test_failures
 
@@ -323,7 +324,7 @@ class TestDeepDiveRegression:
     @patch("utils.jenkins_api.get_build_history")
     @patch("server.TOOL_DELAY", 0)
     @patch("server._BUNDLE_PACING", 0)
-    def test_only_current_build_fails(self, mock_history, mock_test_report, mock_get_build):
+    def test_only_current_build_fails(self, mock_history, mock_test_report, mock_get_build, _mock_xml):
         """Test passes in all prior builds, fails only in current.  Should report 'NEW failure'."""
         from server import deep_dive_test_failures
 

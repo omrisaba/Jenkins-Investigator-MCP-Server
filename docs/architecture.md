@@ -23,8 +23,13 @@ output that fits inside an AI's context window.
 │  └───────┬───────┘  │
 │          │          │
 │  ┌───────────────┐  │
-│  │ Bundle Tools  │  │  6 bundles — composite tools that call
+│  │ Bundle Tools  │  │  7 bundles — composite tools that call
 │  │               │  │  API wrappers directly (not other tools)
+│  └───────┬───────┘  │
+│          │          │
+│  ┌───────────────┐  │
+│  │ XML Enrichment│  │  _enrich_with_junit_xml() — best-effort
+│  │               │  │  JUnit XML parsing for deep_dive bundle
 │  └───────┬───────┘  │
 │          │          │
 │  ┌───────────────┐  │
@@ -38,6 +43,7 @@ output that fits inside an AI's context window.
 │   Utility Layer      │  utils/
 │                     │
 │  jenkins_api.py     │  HTTP wrappers + response pruning
+│  junit_parser.py    │  JUnit XML parsing + classification
 │  log_parser.py      │  Priority-budgeted error extraction
 │  scm.py             │  Changeset normalization (Git/SVN/Hg)
 └────────┬────────────┘
@@ -60,7 +66,7 @@ output that fits inside an AI's context window.
 
 ### server.py — Tool Definitions
 
-All 26 MCP tools are defined here. The file has two kinds:
+All 27 MCP tools are defined here. The file has two kinds:
 
 **Individual tools** call a single `jenkins_api` function, format the result,
 and apply `TOOL_DELAY` once before returning.
@@ -69,6 +75,13 @@ and apply `TOOL_DELAY` once before returning.
 and apply `_BUNDLE_PACING` (50ms) between sub-calls to avoid hammering Jenkins.
 They apply `TOOL_DELAY` only once at the end. This avoids the N × delay penalty
 that would occur if bundles called other tools.
+
+The `deep_dive_test_failures` bundle also includes a best-effort XML enrichment
+pass via `_enrich_with_junit_xml()`, which discovers and parses JUnit XML build
+artifacts to provide failure classification (assertion vs exception), blast-radius
+detection (many tests sharing one root cause), and extended stdout/stderr context.
+This enrichment is entirely optional — it activates only when JUnit XML artifacts
+are archived, and degrades silently when they are not.
 
 ### utils/jenkins_api.py — API Wrappers
 
@@ -120,6 +133,28 @@ Full log (could be 100K+ lines)
 The function is parameterizable: bundles pass custom `max_lines`, `hard_limit`,
 `include_head`, and `include_tail` values to fit their per-section budgets.
 
+### utils/junit_parser.py — JUnit XML Parsing
+
+A pure parser with no API calls or formatting logic. Accepts raw XML content and
+returns structured Python dicts. Three public functions:
+
+- `parse_junit_xml()` — Parses standard JUnit XML (`<testsuite>` or `<testsuites>`
+  root). Extracts per-case status, timing, message, detail, stdout, stderr.
+  Returns `None` for non-JUnit XML.
+
+- `classify_failures()` — Counts assertion failures vs exception errors across
+  all parsed suites. Uses a 3-tier heuristic: the `type` attribute on `<failure>`
+  or `<error>` elements is checked first (e.g. `junit.framework.AssertionError`
+  → assertion, `java.io.IOException` → exception), then the message content is
+  scanned for keywords, and the element tag (`<failure>` vs `<error>`) is used
+  only as a fallback. This handles frameworks like pytest that put all failures
+  under `<failure>` regardless of cause.
+
+- `detect_blast_radius()` — Finds suites where 3+ failures share the same root
+  error (≥60% threshold). When detected, the consuming code collapses N individual
+  test entries into a single blast-radius summary, saving tokens and immediately
+  surfacing the shared root cause.
+
 ### utils/scm.py — SCM Normalization
 
 Normalizes the different changeset formats Jenkins uses (`changeSet` vs `changeSets`,
@@ -134,8 +169,10 @@ Every layer contributes to keeping output small:
 | Jenkins API | `tree` parameter prunes response server-side |
 | `jenkins_api.py` | `_BUILD_KEEP_FIELDS` drops unneeded keys |
 | `log_parser.py` | Line budgets, dedup, severity prioritization |
+| `junit_parser.py` | Parse XML → extract only failing tests; blast-radius collapses N failures into ~4 lines |
 | `server.py` tools | Output hard caps (150–400 lines per tool) |
 | `server.py` bundles | Per-section budgets within overall hard cap |
+| `server.py` XML enrichment | 80-line budget, provenance tracking, only additive info from XML |
 | MCP instructions | Guide AI to bundles first, individual tools only for follow-up |
 
 ## Retry and Resilience
@@ -166,5 +203,7 @@ The server handles missing capabilities without crashing:
 | No EnvInject plugin | `get_injected_env_vars` returns `None`, tool says "plugin not installed" |
 | Ephemeral/cloud agent gone | `get_node_info` catches 404, infra bundle still shows correlation data |
 | No test report | `get_test_report` returns `None`, bundle skips test section |
+| No JUnit XML artifacts | XML enrichment returns `None`, section silently omitted |
+| JUnit XML not JUnit format | Root element check rejects non-JUnit XML, file marked `[SKIP]` in provenance |
 | Binary artifact | `get_artifact_content` returns `None`, tool says "binary file" |
 | No SCM changes | Tools report "no changes recorded" |

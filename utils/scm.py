@@ -64,8 +64,12 @@ def extract_changesets(build_data: dict) -> list[dict]:
 
 
 def _normalize(item: dict) -> dict:
+    paths = item.get("affectedPaths") or item.get("paths") or []
+    if isinstance(paths, list) and paths and isinstance(paths[0], dict):
+        paths = [p.get("file", "") for p in paths]
     return {
         "commit_id": _commit_id(item),
         "author": _author_name(item),
         "message": (item.get("comment") or item.get("msg") or "")[:500].strip(),
+        "affected_paths": paths[:20],
     }

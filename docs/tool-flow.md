@@ -26,6 +26,9 @@ User asks about a Jenkins job
           │                             _issue                      │
           ├── "Which test broke?" ─────► deep_dive_test_failures    │
           │                                                         │
+          ├── "Where else does this                                 │
+          │    error appear?" ─────────► search_across_jobs         │
+          │                                                         │
           └── "Team health?" ──────────► triage_folder              │
                                                                     │
                                     Need more detail? ◄─────────────┘
@@ -100,23 +103,45 @@ Hard cap: 200 lines
 ### deep_dive_test_failures
 
 Tracks when each test first broke and which commit likely caused it.
+When JUnit XML artifacts are available, enriches with failure classification,
+blast-radius detection, and extended stdout/stderr.
 
 ```
 deep_dive_test_failures(job_name, build_number)
          │
+         │  Pass 1: Regression detection
          ├──► get_test_report(build_number) ── top 10 failing tests
          │
          ├──► get_build_history(6) ── previous 5 builds
          │
          ├──► get_test_report(each previous build) ── was test passing?
          │
-         └──► get_build(regression build) ── suspect commits
-              for each test:
-                History: #95:PASS → #96:PASS → #97:FAIL → #98:FAIL
-                Status: NEW failure (or persistent)
-                Suspect: [abc123] dev: "refactored auth module"
+         ├──► get_build(regression build) ── suspect commits
+         │         for each test:
+         │           History: #95:PASS → #96:PASS → #97:FAIL → #98:FAIL
+         │           Status: NEW failure (or persistent)
+         │           Suspect: [abc123] dev: "refactored auth module"
+         │
+         │  Pass 2: JUnit XML enrichment (best-effort)
+         ├──► discover_junit_artifacts ── find TEST-*.xml etc.
+         │
+         ├──► get_artifact_content_raw(each, max 8 files)
+         │
+         └──► junit_parser.parse_junit_xml ── for each file:
+                    │
+                    ├── Provenance: which files parsed, tests/failures per file
+                    │
+                    ├── Classification: N assertion failures, M exceptions
+                    │
+                    ├── Blast radius: suite with 3+ failures sharing same error
+                    │     → collapsed to single root cause (saves tokens)
+                    │
+                    └── Extended detail: stdout/stderr, timing, Caused-by chains
+                          (only for non-blast failures)
 
-Hard cap: 250 lines
+Output sections: TEST FAILURE ANALYSIS | (per test) | XML TEST DETAIL
+Hard cap: 250 lines (XML enrichment budget: 80 lines)
+API calls: 8-21 (regression: 8-13, XML: 1-8 best-effort)
 ```
 
 ### analyze_flaky_job
@@ -182,6 +207,32 @@ triage_folder(folder, recursive=false)
 
 Output: FOLDER TRIAGE | FAILING JOBS (with streak) | UNSTABLE JOBS
 Hard cap: 200 lines
+```
+
+### search_across_jobs
+
+Searches console logs across all jobs in a folder for a specific error pattern.
+
+```
+search_across_jobs(folder, pattern, ...)
+         │
+         ├──► get_folder_jobs(folder, include_last_failed=true)
+         │         │
+         │         ├── Filter by status (all / failing / unstable_and_failing)
+         │         ├── Prioritise: failing > unstable > healthy
+         │         └── Resolve build number per job (last or last_failed)
+         │
+         ├──► (if recursive) get_folder_jobs(each subfolder, max 10)
+         │
+         └──► ThreadPoolExecutor(8 workers):
+                    for each job (max 50):
+                      get_console_text_tail(~500 KB)
+                      regex search with context lines
+                      early termination at 30 total matches
+
+Output: SEARCH RESULTS grouped by job, match count, snippets
+Hard cap: 300 lines
+API calls: 1 (discovery) + up to 50 (log fetches, concurrent)
 ```
 
 ## Individual Tools — Quick Reference
